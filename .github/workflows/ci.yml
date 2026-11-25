@@ -30,7 +30,11 @@ jobs:
         run: terraform init -backend=false -input=false
 
       - name: terraform validate
-        run: terraform validate
+        run: |
+          # Print each diagnostic as a GitHub annotation so it shows on the PR / run summary.
+          terraform validate -json > validate.json || true
+          jq -r '.diagnostics[] | "::\(if .severity == "error" then "error" else "warning" end) file=terraform/\(.range.filename // "."),line=\(.range.start.line // 1)::\(.summary): \(.detail // "" | gsub("\n"; " "))"' validate.json
+          jq -e '.valid' validate.json > /dev/null
 
       - uses: terraform-linters/setup-tflint@v4
 
