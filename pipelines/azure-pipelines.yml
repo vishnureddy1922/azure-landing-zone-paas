@@ -1,0 +1,262 @@
+# Azure DevOps pipeline: validate -> plan -> (manual approval) -> apply -> deploy app -> log alerts
+#
+# One-time setup (see README "Azure DevOps setup"):
+#   * Service connection "sc-alz-azure" (workload identity federation) with Contributor +
+#     User Access Administrator + Resource Policy Contributor on the subscription.
+#   * Variable group "alz-terraform": TF_STATE_RG, TF_STATE_SA, TF_STATE_CONTAINER,
+#     ALERT_EMAIL, OWNER, SQL_ADMIN_GROUP_NAME, SQL_ADMIN_GROUP_OBJECT_ID, AGENT_IP_RANGES (JSON list).
+#   * Environment "alz-dev" with an Approvals check (this is the approval gate before apply).
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [terraform/*, app/*, bicep/*, pipelines/*]
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  - group: alz-terraform
+  - name: serviceConnection
+    value: sc-alz-azure
+  - name: environmentName
+    value: dev
+  - name: terraformVersion
+    value: 1.9.8
+  - name: tfDir
+    value: $(System.DefaultWorkingDirectory)/terraform
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # -------------------------------------------------------------------------
+  - stage: Validate
+    displayName: Validate and test
+    jobs:
+      - job: terraform_static
+        displayName: Terraform fmt, validate, tflint, checkov
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - script: terraform fmt -check -recursive
+            displayName: terraform fmt
+            workingDirectory: $(tfDir)
+
+          - script: |
+              terraform init -backend=false -input=false
+              terraform validate
+            displayName: terraform validate
+            workingDirectory: $(tfDir)
+
+          - script: |
+              curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+              tflint --init
+              tflint --recursive --format compact
+            displayName: tflint
+            workingDirectory: $(tfDir)
+
+          - script: |
+              pip install --quiet checkov
+              checkov -d . --framework terraform --quiet --soft-fail \
+                --output junitxml > $(Build.ArtifactStagingDirectory)/checkov.xml
+            displayName: checkov security scan
+            workingDirectory: $(tfDir)
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: $(Build.ArtifactStagingDirectory)/checkov.xml
+              testRunTitle: Checkov
+
+          - script: az bicep build --file bicep/monitoring/log-alerts.bicep --stdout > /dev/null
+            displayName: bicep build
+
+      - job: app_tests
+        displayName: App unit tests
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.12"
+          - script: |
+              pip install -r app/requirements.txt pytest
+              pytest app/tests --junitxml=$(Build.ArtifactStagingDirectory)/pytest.xml
+            displayName: pytest
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFiles: $(Build.ArtifactStagingDirectory)/pytest.xml
+              testRunTitle: App unit tests
+          - task: ArchiveFiles@2
+            inputs:
+              rootFolderOrFile: app
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/app.zip
+          - publish: $(Build.ArtifactStagingDirectory)/app.zip
+            artifact: app
+
+  # -------------------------------------------------------------------------
+  - stage: Plan
+    displayName: Terraform plan
+    dependsOn: Validate
+    jobs:
+      - job: plan
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: AzureCLI@2
+            displayName: terraform init and plan
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true # exposes servicePrincipalId, idToken, tenantId
+              workingDirectory: $(tfDir)
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_OIDC_TOKEN="$idToken"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_USE_OIDC=true
+
+                terraform init -input=false \
+                  -backend-config="resource_group_name=$(TF_STATE_RG)" \
+                  -backend-config="storage_account_name=$(TF_STATE_SA)" \
+                  -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+                  -backend-config="key=alz-$(environmentName).tfstate" \
+                  -backend-config="use_azuread_auth=true"
+
+                cat > ci.auto.tfvars <<EOF
+                environment               = "$(environmentName)"
+                owner                     = "$(OWNER)"
+                alert_email               = "$(ALERT_EMAIL)"
+                sql_admin_group_name      = "$(SQL_ADMIN_GROUP_NAME)"
+                sql_admin_group_object_id = "$(SQL_ADMIN_GROUP_OBJECT_ID)"
+                admin_ip_ranges           = $(AGENT_IP_RANGES)
+                EOF
+
+                terraform plan -input=false -out=tfplan -detailed-exitcode || rc=$?
+                rc=${rc:-0}
+                if [ "$rc" -eq 1 ]; then exit 1; fi
+                echo "##vso[task.setvariable variable=hasChanges;isOutput=true]$([ "$rc" -eq 2 ] && echo true || echo false)"
+                terraform show -no-color tfplan > tfplan.txt
+            name: tfplan
+
+          - publish: $(tfDir)
+            artifact: tfplan
+            displayName: Publish plan
+
+  # -------------------------------------------------------------------------
+  - stage: Apply
+    displayName: Terraform apply (approval required)
+    dependsOn: Plan
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: apply
+        environment: alz-$(environmentName) # approval check configured on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+                - task: AzureCLI@2
+                  displayName: terraform apply
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    workingDirectory: $(Pipeline.Workspace)/tfplan
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_CLIENT_ID="$servicePrincipalId"
+                      export ARM_OIDC_TOKEN="$idToken"
+                      export ARM_TENANT_ID="$tenantId"
+                      export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                      export ARM_USE_OIDC=true
+                      chmod -R +x .terraform/providers
+                      terraform apply -input=false -auto-approve tfplan
+                      terraform output -json > outputs.json
+                - publish: $(Pipeline.Workspace)/tfplan/outputs.json
+                  artifact: tfoutputs
+
+  # -------------------------------------------------------------------------
+  - stage: Deploy
+    displayName: Deploy app (staging slot, smoke test, swap)
+    dependsOn: Apply
+    jobs:
+      - deployment: app
+        environment: alz-$(environmentName)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: tfoutputs
+                - download: current
+                  artifact: app
+                - task: AzureCLI@2
+                  displayName: Deploy to staging, smoke test, swap to production
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      OUT=$(Pipeline.Workspace)/tfoutputs/outputs.json
+                      RG=$(jq -r .workload_resource_group.value "$OUT")
+                      APP=$(jq -r .web_app_name.value "$OUT")
+                      AGENT_IP=$(curl -s https://api.ipify.org)
+
+                      az webapp deploy -g "$RG" -n "$APP" --slot staging \
+                        --src-path $(Pipeline.Workspace)/app/app.zip --type zip
+
+                      # Staging denies all inbound traffic; open it to this agent only for the smoke test.
+                      az webapp config access-restriction add -g "$RG" -n "$APP" --slot staging \
+                        --rule-name pipeline-agent --action Allow --ip-address "$AGENT_IP/32" --priority 50
+                      trap 'az webapp config access-restriction remove -g "$RG" -n "$APP" --slot staging --rule-name pipeline-agent' EXIT
+
+                      HOST=$(az webapp show -g "$RG" -n "$APP" --slot staging --query defaultHostName -o tsv)
+                      for i in $(seq 1 30); do
+                        if curl -fsS "https://$HOST/ready"; then echo; echo "staging is ready"; break; fi
+                        [ "$i" -eq 30 ] && { echo "staging never became ready"; exit 1; }
+                        sleep 10
+                      done
+
+                      az webapp deployment slot swap -g "$RG" -n "$APP" --slot staging --target-slot production
+                      echo "Swapped. Roll back with the same swap command if production alerts fire."
+
+  # -------------------------------------------------------------------------
+  - stage: Monitoring
+    displayName: Deploy KQL log alerts (Bicep)
+    dependsOn: Apply
+    jobs:
+      - job: bicep
+        steps:
+          - download: current
+            artifact: tfoutputs
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                OUT=$(Pipeline.Workspace)/tfoutputs/outputs.json
+                az deployment group create \
+                  --resource-group "$(jq -r .hub_resource_group.value "$OUT")" \
+                  --template-file bicep/monitoring/log-alerts.bicep \
+                  --parameters workspaceId="$(jq -r .log_analytics_workspace_id.value "$OUT")" \
+                               actionGroupId="$(jq -r .action_group_id.value "$OUT")" \
+                               namePrefix="alz-$(environmentName)"

@@ -1,0 +1,30 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+tfplan.txt
+crash.log
+*.tfvars
+!*.tfvars.example
+*.auto.tfvars
+backend.hcl
+override.tf
+override.tf.json
+*_override.tf
+.terraform.lock.hcl.bak
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Bicep build output
+bicep/**/*.json
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
