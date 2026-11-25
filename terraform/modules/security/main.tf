@@ -25,7 +25,7 @@ resource "azurerm_key_vault" "this" {
   location                      = var.location
   tenant_id                     = var.tenant_id
   sku_name                      = "standard"
-  enable_rbac_authorization     = true
+  rbac_authorization_enabled    = true
   purge_protection_enabled      = true
   soft_delete_retention_days    = 30
   public_network_access_enabled = true # data plane is still limited by network_acls below
@@ -227,7 +227,7 @@ locals {
 }
 
 resource "azurerm_policy_definition" "this" {
-  for_each     = var.enable_policy ? local.policies : {}
+  for_each     = { for k, v in local.policies : k => v if var.enable_policy }
   name         = "alz-${each.key}"
   display_name = "[ALZ] ${each.value.display_name}"
   policy_type  = "Custom"

@@ -120,12 +120,13 @@ resource "azurerm_linux_web_app_slot" "staging" {
   }
 
   site_config {
-    always_on              = true
-    ftps_state             = "Disabled"
-    minimum_tls_version    = "1.2"
-    vnet_route_all_enabled = true
-    health_check_path      = "/health"
-    app_command_line       = "gunicorn --bind=0.0.0.0:8000 --timeout 120 --workers 2 main:app"
+    always_on                         = true
+    ftps_state                        = "Disabled"
+    minimum_tls_version               = "1.2"
+    vnet_route_all_enabled            = true
+    health_check_path                 = "/health"
+    health_check_eviction_time_in_min = 5
+    app_command_line                  = "gunicorn --bind=0.0.0.0:8000 --timeout 120 --workers 2 main:app"
 
     application_stack {
       python_version = "3.12"
